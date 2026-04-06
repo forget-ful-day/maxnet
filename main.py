@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 MaxNet: локальная мини-поисковая система с публикацией сайтов,
-встроенным Chromium-движком и синхронизацией через GitHub.
+встроенным WebView-окном и синхронизацией через GitHub.
 
 Запуск:
-  python main.py            # GUI + встроенный браузер + сервер
-  python main.py --daemon   # только сервер + трей
+  python main.py            # GUI (webview) + сервер
+  python main.py --daemon   # только сервер (без графики)
 """
 
 from __future__ import annotations
@@ -16,30 +16,17 @@ import io
 import json
 import os
 import shutil
-import sys
 import threading
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import requests
-from flask import (
-    Flask,
-    jsonify,
-    redirect,
-    render_template_string,
-    request,
-    send_from_directory,
-    url_for,
-)
+import webview
+from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, url_for
 from werkzeug.utils import secure_filename
-
-from PyQt6.QtCore import QTimer, QUrl
-from PyQt6.QtGui import QAction, QIcon
-from PyQt6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMainWindow, QMenu, QMessageBox, QSystemTrayIcon
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 APP_NAME = "maxnet"
 PORT = 8765
@@ -90,12 +77,12 @@ class Storage:
     def load_json(self, file_path: Path, fallback: dict) -> dict:
         if not file_path.exists():
             return fallback
-        with file_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        with file_path.open("r", encoding="utf-8") as file_obj:
+            return json.load(file_obj)
 
     def save_json(self, file_path: Path, data: dict) -> None:
-        with file_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with file_path.open("w", encoding="utf-8") as file_obj:
+            json.dump(data, file_obj, ensure_ascii=False, indent=2)
 
     def get_config(self) -> dict:
         return self.load_json(self.paths.config_file, {})
@@ -112,7 +99,7 @@ class Storage:
     def list_sites(self) -> List[dict]:
         index_data = self.get_index()
         sites = index_data.get("sites", [])
-        return sorted(sites, key=lambda x: x.get("domain", ""))
+        return sorted(sites, key=lambda item: item.get("domain", ""))
 
     def _domain_dir(self, domain: str) -> Path:
         clean = secure_filename(domain.lower())
@@ -129,13 +116,7 @@ class Storage:
                 found = True
                 break
         if not found:
-            sites.append(
-                {
-                    "domain": domain,
-                    "title": title,
-                    "updated_at": int(time.time()),
-                }
-            )
+            sites.append({"domain": domain, "title": title, "updated_at": int(time.time())})
         index_data["sites"] = sites
         self.save_index(index_data)
 
@@ -163,8 +144,9 @@ class Storage:
         if site_dir.exists():
             shutil.rmtree(site_dir)
         site_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-            zf.extractall(site_dir)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_file:
+            zip_file.extractall(site_dir)
+
         index_file = site_dir / "index.html"
         if not index_file.exists():
             raise ValueError("В архиве нет index.html")
@@ -172,17 +154,17 @@ class Storage:
 
     def bundle_sites_to_zip(self) -> bytes:
         buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
             for path in self.paths.sites_dir.rglob("*"):
                 if path.is_file():
                     rel = path.relative_to(self.paths.root)
-                    zf.write(path, rel.as_posix())
-            zf.write(self.paths.index_file, self.paths.index_file.relative_to(self.paths.root).as_posix())
+                    zip_file.write(path, rel.as_posix())
+            zip_file.write(self.paths.index_file, self.paths.index_file.relative_to(self.paths.root).as_posix())
         return buffer.getvalue()
 
     def apply_bundle_zip(self, zip_bytes: bytes) -> None:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
-            zf.extractall(self.paths.root)
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_file:
+            zip_file.extractall(self.paths.root)
 
 
 class GitHubSync:
@@ -209,24 +191,24 @@ class GitHubSync:
             return
 
         url = self._contents_url(repo, bundle_path)
-        resp = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
-        if resp.status_code != 200:
+        response = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
+        if response.status_code != 200:
             return
 
-        data = resp.json()
-        remote_sha = data.get("sha", "")
+        payload = response.json()
+        remote_sha = payload.get("sha", "")
         if remote_sha == cfg.get("last_remote_sha", ""):
             return
 
-        download_url = data.get("download_url", "")
+        download_url = payload.get("download_url", "")
         if not download_url:
             return
 
-        raw_resp = requests.get(download_url, timeout=30)
-        if raw_resp.status_code != 200:
+        raw_response = requests.get(download_url, timeout=30)
+        if raw_response.status_code != 200:
             return
 
-        zip_bytes = raw_resp.content
+        zip_bytes = raw_response.content
         self.storage.paths.cache_zip.write_bytes(zip_bytes)
         self.storage.apply_bundle_zip(zip_bytes)
 
@@ -247,9 +229,9 @@ class GitHubSync:
 
         url = self._contents_url(repo, bundle_path)
         sha = ""
-        get_resp = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
-        if get_resp.status_code == 200:
-            sha = get_resp.json().get("sha", "")
+        get_response = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
+        if get_response.status_code == 200:
+            sha = get_response.json().get("sha", "")
 
         body = {
             "message": "MaxNet sync bundle",
@@ -259,9 +241,9 @@ class GitHubSync:
         if sha:
             body["sha"] = sha
 
-        put_resp = requests.put(url, headers=self._headers(token), json=body, timeout=40)
-        if put_resp.status_code in (200, 201):
-            new_sha = put_resp.json().get("content", {}).get("sha", "")
+        put_response = requests.put(url, headers=self._headers(token), json=body, timeout=40)
+        if put_response.status_code in (200, 201):
+            new_sha = put_response.json().get("content", {}).get("sha", "")
             if new_sha:
                 cfg["last_remote_sha"] = new_sha
                 self.storage.save_config(cfg)
@@ -279,13 +261,14 @@ class MaxNetServer:
         sites = self.storage.list_sites()
         if not q:
             return sites
-        result = []
+
+        results = []
         for site in sites:
             domain = site.get("domain", "").lower()
             title = site.get("title", "").lower()
             if q in domain or q in title:
-                result.append(site)
-        return result
+                results.append(site)
+        return results
 
     def _setup_routes(self) -> None:
         @self.app.get("/")
@@ -347,8 +330,8 @@ class MaxNetServer:
             q = request.args.get("q", "").lower().strip()
             if "создать" in q or "сайт" in q:
                 answer = "Откройте Создать сайт, введите домен и загрузите ZIP или вставьте HTML."
-            elif "github" in q:
-                answer = "Настройте github_repo и github_token в ~/Documents/MaxNet/config.json."
+            elif "github" in q or "git" in q:
+                answer = "Откройте раздел 'Как настроить GitHub' на странице создания сайта."
             else:
                 answer = "Я бот MaxNet: помогаю с поиском, публикацией и синхронизацией сайтов."
             return jsonify({"q": q, "answer": answer})
@@ -361,13 +344,13 @@ class SyncWorker(threading.Thread):
     def __init__(self, sync: GitHubSync):
         super().__init__(daemon=True)
         self.sync = sync
-        self._active = True
+        self.active = True
 
     def stop(self) -> None:
-        self._active = False
+        self.active = False
 
     def run(self) -> None:
-        while self._active:
+        while self.active:
             self.sync.pull_if_changed()
             time.sleep(SYNC_INTERVAL_SECONDS)
 
@@ -391,19 +374,19 @@ def setup_autostart(storage: Storage) -> None:
     if os.name == "nt":
         startup = Path.home() / "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"
         startup.mkdir(parents=True, exist_ok=True)
-        bat = startup / "maxnet_autostart.bat"
-        bat.write_text(f'@echo off\nstart "" "{sys.executable}" "{script_path}" --daemon\n', encoding="utf-8")
+        bat_file = startup / "maxnet_autostart.bat"
+        bat_file.write_text(f'@echo off\nstart "" "{os.sys.executable}" "{script_path}" --daemon\n', encoding="utf-8")
     else:
         autostart = Path.home() / ".config/autostart"
         autostart.mkdir(parents=True, exist_ok=True)
-        desktop = autostart / "maxnet.desktop"
-        desktop.write_text(
+        desktop_file = autostart / "maxnet.desktop"
+        desktop_file.write_text(
             "\n".join(
                 [
                     "[Desktop Entry]",
                     "Type=Application",
                     "Name=MaxNet Daemon",
-                    f"Exec={sys.executable} {script_path} --daemon",
+                    f"Exec={os.sys.executable} {script_path} --daemon",
                     "X-GNOME-Autostart-enabled=true",
                 ]
             ),
@@ -414,66 +397,15 @@ def setup_autostart(storage: Storage) -> None:
     storage.save_config(cfg)
 
 
-class MaxNetWindow(QMainWindow):
-    def __init__(self, storage: Storage):
-        super().__init__()
-        self.storage = storage
-        self.setWindowTitle("MaxNet Browser")
-        self.resize(1280, 800)
-
-        self.browser = QWebEngineView()
-        self.setCentralWidget(self.browser)
-        self.browser.load(QUrl(f"http://127.0.0.1:{PORT}/"))
-
-        self._build_menu()
-
-    def _build_menu(self) -> None:
-        menu = self.menuBar()
-
-        app_menu = menu.addMenu("MaxNet")
-        open_home = QAction("Главная", self)
-        open_home.triggered.connect(lambda: self.browser.load(QUrl(f"http://127.0.0.1:{PORT}/")))
-
-        open_create = QAction("Создать сайт", self)
-        open_create.triggered.connect(lambda: self.browser.load(QUrl(f"http://127.0.0.1:{PORT}/create")))
-
-        upload_zip = QAction("Загрузить ZIP", self)
-        upload_zip.triggered.connect(self.upload_zip_dialog)
-
-        app_menu.addAction(open_home)
-        app_menu.addAction(open_create)
-        app_menu.addAction(upload_zip)
-
-    def upload_zip_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите zip", str(Path.home()), "ZIP (*.zip)")
-        if not path:
-            return
-        domain, ok = QInputDialog.getText(self, "Домен", "Введите домен (например: my-site):")
-        if not ok or not domain:
-            return
-
-        with open(path, "rb") as f:
-            files = {"archive": (Path(path).name, f, "application/zip")}
-            data = {"domain": domain}
-            resp = requests.post(f"http://127.0.0.1:{PORT}/publish/zip", files=files, data=data, timeout=60)
-            if resp.status_code not in (200, 302):
-                QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить ZIP: {resp.text}")
-                return
-
-        self.browser.load(QUrl(f"http://127.0.0.1:{PORT}/"))
+def run_daemon_forever() -> None:
+    while True:
+        time.sleep(3600)
 
 
-class TrayController:
-    def __init__(self, app: QApplication):
-        self.app = app
-        self.tray = QSystemTrayIcon(QIcon())
-        self.tray.setToolTip("MaxNet daemon")
-        menu = QMenu()
-        quit_action = QAction("Выход", self.app)
-        quit_action.triggered.connect(self.app.quit)
-        menu.addAction(quit_action)
-        self.tray.setContextMenu(menu)
-        self.tray.show()
+def open_webview() -> None:
+    window = webview.create_window("MaxNet", f"http://127.0.0.1:{PORT}/", width=1280, height=800)
+    webview.start(gui=None, debug=False)
+    _ = window
 
 
 HOME_TEMPLATE = """
@@ -538,6 +470,8 @@ CREATE_TEMPLATE = """
     textarea { min-height: 220px; }
     button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
     a { color:#1344d4; text-decoration:none; }
+    details { margin-top: 8px; }
+    code { background: #eff3ff; padding: 2px 4px; border-radius: 4px; }
   </style>
 </head>
 <body>
@@ -567,6 +501,22 @@ CREATE_TEMPLATE = """
       <button type="submit">Загрузить ZIP</button>
     </form>
   </div>
+
+  <div class="box">
+    <h3>Как настроить GitHub для синхронизации</h3>
+    <ol>
+      <li>Создайте personal access token на GitHub (минимум: <code>repo</code>).</li>
+      <li>Откройте файл <code>~/Documents/MaxNet/config.json</code>.</li>
+      <li>Заполните:</li>
+    </ol>
+    <pre>{
+  "github_repo": "ВАШ_ЛОГИН/ВАШ_РЕПО",
+  "github_token": "ghp_xxx",
+  "github_branch": "main",
+  "bundle_path": "maxnet/sites_bundle.zip"
+}</pre>
+    <p>После публикации сайта MaxNet сам отправит bundle в GitHub.</p>
+  </div>
 </body>
 </html>
 """
@@ -575,6 +525,7 @@ CREATE_TEMPLATE = """
 def run_app(with_gui: bool) -> None:
     storage = Storage()
     setup_autostart(storage)
+
     sync = GitHubSync(storage)
     server = MaxNetServer(storage, sync)
 
@@ -584,25 +535,18 @@ def run_app(with_gui: bool) -> None:
     sync_worker = SyncWorker(sync)
     sync_worker.start()
 
-    if not with_gui:
-        app = QApplication(sys.argv)
-        TrayController(app)
-        timer = QTimer()
-        timer.start(1000)
-        timer.timeout.connect(lambda: None)
-        sys.exit(app.exec())
+    if with_gui:
+        open_webview()
+        return
 
-    app = QApplication(sys.argv)
-    TrayController(app)
-    window = MaxNetWindow(storage)
-    window.show()
-    sys.exit(app.exec())
+    run_daemon_forever()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MaxNet launcher")
-    parser.add_argument("--daemon", action="store_true", help="run only daemon + tray")
+    parser.add_argument("--daemon", action="store_true", help="run only server + sync (no GUI)")
     args = parser.parse_args()
+
     run_app(with_gui=not args.daemon)
 
 
