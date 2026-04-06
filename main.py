@@ -32,6 +32,13 @@ APP_NAME = "maxnet"
 PORT = 8765
 SYNC_INTERVAL_SECONDS = 120
 
+# Настройка GitHub прямо в коде (как просили).
+# Заполните эти значения вручную:
+GITHUB_REPO = ""  # пример: "your_login/your_repo"
+GITHUB_TOKEN = ""  # пример: "ghp_xxx"
+GITHUB_BRANCH = "main"
+GITHUB_ROOT = "maxnet/sites"
+
 
 @dataclass
 class AppPaths:
@@ -62,10 +69,6 @@ class Storage:
         if not self.paths.config_file.exists():
             default = {
                 "first_run": True,
-                "github_repo": "",
-                "github_token": "",
-                "github_branch": "main",
-                "github_root": "maxnet/sites",
             }
             self.save_json(self.paths.config_file, default)
         if not self.paths.index_file.exists():
@@ -192,11 +195,10 @@ class GitHubSync:
         return f"https://api.github.com/repos/{repo}/git/trees/{branch}"
 
     def _cfg(self) -> tuple[str, str, str, str]:
-        cfg = self.storage.get_config()
-        repo = cfg.get("github_repo", "").strip()
-        token = cfg.get("github_token", "").strip()
-        branch = cfg.get("github_branch", "main").strip() or "main"
-        root = cfg.get("github_root", "maxnet/sites").strip().strip("/")
+        repo = GITHUB_REPO.strip()
+        token = GITHUB_TOKEN.strip()
+        branch = GITHUB_BRANCH.strip() or "main"
+        root = GITHUB_ROOT.strip().strip("/") or "maxnet/sites"
         return repo, token, branch, root
 
     def _remote_tree_paths(self, repo: str, token: str, branch: str) -> Dict[str, str]:
@@ -330,21 +332,6 @@ class MaxNetServer:
         def create_form():
             return render_template_string(CREATE_TEMPLATE)
 
-        @self.app.get("/settings/git")
-        def git_settings_form():
-            cfg = self.storage.get_config()
-            return render_template_string(GIT_SETTINGS_TEMPLATE, cfg=cfg)
-
-        @self.app.post("/settings/git")
-        def git_settings_save():
-            cfg = self.storage.get_config()
-            cfg["github_repo"] = request.form.get("github_repo", "").strip()
-            cfg["github_token"] = request.form.get("github_token", "").strip()
-            cfg["github_branch"] = request.form.get("github_branch", "main").strip() or "main"
-            cfg["github_root"] = request.form.get("github_root", "maxnet/sites").strip().strip("/") or "maxnet/sites"
-            self.storage.save_config(cfg)
-            return redirect(url_for("git_settings_form"))
-
         @self.app.post("/sync/pull")
         def sync_pull():
             self.sync.pull_missing_files()
@@ -401,7 +388,7 @@ class MaxNetServer:
             if "создать" in q or "сайт" in q:
                 answer = "Откройте Создать сайт, введите домен и загрузите ZIP или вставьте HTML."
             elif "github" in q or "git" in q:
-                answer = "Откройте Настройки GitHub и заполните repo/token/branch/root."
+                answer = "Откройте main.py и заполните переменные GITHUB_REPO/GITHUB_TOKEN/GITHUB_BRANCH/GITHUB_ROOT."
             else:
                 answer = "Я бот MaxNet: помогаю с поиском, публикацией и синхронизацией сайтов."
             return jsonify({"q": q, "answer": answer})
@@ -506,7 +493,6 @@ HOME_TEMPLATE = """
     </form>
     <div class="row">
       <a class="btn" href="/create">Создать сайт</a>
-      <a class="btn" href="/settings/git">Настройки GitHub</a>
       <form class="inline" method="post" action="/sync/pull"><button class="btn" type="submit">Забрать новые из GitHub</button></form>
       <form class="inline" method="post" action="/sync/push"><button class="btn" type="submit">Добавить новые в GitHub</button></form>
     </div>
@@ -583,47 +569,7 @@ CREATE_TEMPLATE = """
       <li>в GitHub отправляются только отсутствующие в репозитории файлы;</li>
       <li>удаление файлов из репозитория MaxNet не делает.</li>
     </ul>
-    <p>Настройки откройте в <a href="/settings/git">GitHub Settings</a>.</p>
-  </div>
-</body>
-</html>
-"""
-
-
-GIT_SETTINGS_TEMPLATE = """
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GitHub настройки — MaxNet</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
-    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); max-width: 860px; }
-    input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top:6px; margin-bottom: 12px; }
-    button { padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
-    a { color:#1344d4; text-decoration:none; }
-  </style>
-</head>
-<body>
-  <h1>GitHub настройки</h1>
-  <a href="/">← Назад на главную</a>
-  <div class="box">
-    <form method="post" action="/settings/git">
-      <label>github_repo (формат: owner/repo)</label>
-      <input type="text" name="github_repo" value="{{ cfg.github_repo or '' }}" placeholder="your_login/your_repo" required>
-
-      <label>github_token (PAT c правами repo)</label>
-      <input type="password" name="github_token" value="{{ cfg.github_token or '' }}" placeholder="ghp_xxx" required>
-
-      <label>github_branch</label>
-      <input type="text" name="github_branch" value="{{ cfg.github_branch or 'main' }}" placeholder="main" required>
-
-      <label>github_root (папка в репозитории)</label>
-      <input type="text" name="github_root" value="{{ cfg.github_root or 'maxnet/sites' }}" placeholder="maxnet/sites" required>
-
-      <button type="submit">Сохранить</button>
-    </form>
+    <p>Настройки GitHub задаются прямо в <code>main.py</code> (переменные вверху файла).</p>
   </div>
 </body>
 </html>

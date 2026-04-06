@@ -20,16 +20,14 @@ python main.py
 python main.py --daemon
 ```
 
-## Настройка GitHub в коде (через интерфейс)
+## Настройка GitHub через переменные в коде
 
-1. Запустите MaxNet.
-2. Откройте `Настройки GitHub` (`/settings/git`).
-3. Заполните:
-   - `github_repo` — формат `owner/repo`
-   - `github_token` — PAT с правами `repo`
-   - `github_branch` — обычно `main`
-   - `github_root` — папка в репозитории, например `maxnet/sites`
-4. Сохраните форму.
+Откройте `main.py` и заполните переменные вверху файла:
+
+- `GITHUB_REPO` — формат `owner/repo`
+- `GITHUB_TOKEN` — PAT с правами `repo`
+- `GITHUB_BRANCH` — обычно `main`
+- `GITHUB_ROOT` — папка в репозитории, например `maxnet/sites`
 
 ## Режим синхронизации (только добавление)
 
