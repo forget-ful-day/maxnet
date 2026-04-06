@@ -12,16 +12,16 @@ from __future__ import annotations
 
 import argparse
 import base64
-import io
 import json
 import os
+import re
 import shutil
 import threading
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import requests
 import webview
@@ -39,7 +39,6 @@ class AppPaths:
     sites_dir: Path
     config_file: Path
     index_file: Path
-    cache_zip: Path
 
 
 class Storage:
@@ -51,7 +50,6 @@ class Storage:
             sites_dir=root / "sites",
             config_file=root / "config.json",
             index_file=root / "sites_index.json",
-            cache_zip=root / "sites_bundle.zip",
         )
         self._prepare_dirs()
         self._ensure_defaults()
@@ -67,8 +65,7 @@ class Storage:
                 "github_repo": "",
                 "github_token": "",
                 "github_branch": "main",
-                "bundle_path": "maxnet/sites_bundle.zip",
-                "last_remote_sha": "",
+                "github_root": "maxnet/sites",
             }
             self.save_json(self.paths.config_file, default)
         if not self.paths.index_file.exists():
@@ -120,6 +117,27 @@ class Storage:
         index_data["sites"] = sites
         self.save_index(index_data)
 
+    def _extract_title_from_index(self, index_file: Path, fallback: str) -> str:
+        if not index_file.exists():
+            return fallback
+        html = index_file.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            title = re.sub(r"\s+", " ", match.group(1)).strip()
+            if title:
+                return title
+        return fallback
+
+    def rebuild_index_from_sites(self) -> None:
+        sites: List[dict] = []
+        for domain_dir in sorted(self.paths.sites_dir.iterdir()):
+            if not domain_dir.is_dir():
+                continue
+            domain = domain_dir.name
+            title = self._extract_title_from_index(domain_dir / "index.html", domain)
+            sites.append({"domain": domain, "title": title, "updated_at": int(time.time())})
+        self.save_index({"sites": sites})
+
     def save_simple_page(self, domain: str, title: str, html_content: str) -> None:
         site_dir = self._domain_dir(domain)
         site_dir.mkdir(parents=True, exist_ok=True)
@@ -139,32 +157,21 @@ class Storage:
         index_file.write_text(wrapped_html, encoding="utf-8")
         self.add_or_update_site(domain, title)
 
-    def save_site_archive(self, domain: str, zip_bytes: bytes) -> None:
+    def save_site_archive(self, domain: str, zip_path: Path) -> None:
         site_dir = self._domain_dir(domain)
         if site_dir.exists():
             shutil.rmtree(site_dir)
         site_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_file:
+
+        with zipfile.ZipFile(zip_path, "r") as zip_file:
             zip_file.extractall(site_dir)
 
         index_file = site_dir / "index.html"
         if not index_file.exists():
             raise ValueError("В архиве нет index.html")
-        self.add_or_update_site(domain, domain)
 
-    def bundle_sites_to_zip(self) -> bytes:
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-            for path in self.paths.sites_dir.rglob("*"):
-                if path.is_file():
-                    rel = path.relative_to(self.paths.root)
-                    zip_file.write(path, rel.as_posix())
-            zip_file.write(self.paths.index_file, self.paths.index_file.relative_to(self.paths.root).as_posix())
-        return buffer.getvalue()
-
-    def apply_bundle_zip(self, zip_bytes: bytes) -> None:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_file:
-            zip_file.extractall(self.paths.root)
+        title = self._extract_title_from_index(index_file, domain)
+        self.add_or_update_site(domain, title)
 
 
 class GitHubSync:
@@ -178,75 +185,107 @@ class GitHubSync:
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
-    def _contents_url(self, repo: str, bundle_path: str) -> str:
-        return f"https://api.github.com/repos/{repo}/contents/{bundle_path}"
+    def _contents_url(self, repo: str, remote_path: str) -> str:
+        return f"https://api.github.com/repos/{repo}/contents/{remote_path}"
 
-    def pull_if_changed(self) -> None:
+    def _tree_url(self, repo: str, branch: str) -> str:
+        return f"https://api.github.com/repos/{repo}/git/trees/{branch}"
+
+    def _cfg(self) -> tuple[str, str, str, str]:
         cfg = self.storage.get_config()
         repo = cfg.get("github_repo", "").strip()
         token = cfg.get("github_token", "").strip()
-        branch = cfg.get("github_branch", "main").strip()
-        bundle_path = cfg.get("bundle_path", "maxnet/sites_bundle.zip").strip()
-        if not repo or not token:
-            return
+        branch = cfg.get("github_branch", "main").strip() or "main"
+        root = cfg.get("github_root", "maxnet/sites").strip().strip("/")
+        return repo, token, branch, root
 
-        url = self._contents_url(repo, bundle_path)
-        response = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
+    def _remote_tree_paths(self, repo: str, token: str, branch: str) -> Dict[str, str]:
+        response = requests.get(
+            self._tree_url(repo, branch),
+            headers=self._headers(token),
+            params={"recursive": "1"},
+            timeout=30,
+        )
         if response.status_code != 200:
-            return
+            return {}
 
-        payload = response.json()
-        remote_sha = payload.get("sha", "")
-        if remote_sha == cfg.get("last_remote_sha", ""):
-            return
+        tree = response.json().get("tree", [])
+        result: Dict[str, str] = {}
+        for item in tree:
+            if item.get("type") == "blob":
+                result[item.get("path", "")] = item.get("sha", "")
+        return result
 
-        download_url = payload.get("download_url", "")
-        if not download_url:
-            return
-
-        raw_response = requests.get(download_url, timeout=30)
-        if raw_response.status_code != 200:
-            return
-
-        zip_bytes = raw_response.content
-        self.storage.paths.cache_zip.write_bytes(zip_bytes)
-        self.storage.apply_bundle_zip(zip_bytes)
-
-        cfg["last_remote_sha"] = remote_sha
-        self.storage.save_config(cfg)
-
-    def push_bundle(self) -> None:
-        cfg = self.storage.get_config()
-        repo = cfg.get("github_repo", "").strip()
-        token = cfg.get("github_token", "").strip()
-        branch = cfg.get("github_branch", "main").strip()
-        bundle_path = cfg.get("bundle_path", "maxnet/sites_bundle.zip").strip()
+    def pull_missing_files(self) -> None:
+        repo, token, branch, root = self._cfg()
         if not repo or not token:
             return
 
-        local_zip = self.storage.bundle_sites_to_zip()
-        self.storage.paths.cache_zip.write_bytes(local_zip)
+        remote_paths = self._remote_tree_paths(repo, token, branch)
+        if not remote_paths:
+            return
 
-        url = self._contents_url(repo, bundle_path)
-        sha = ""
-        get_response = requests.get(url, headers=self._headers(token), params={"ref": branch}, timeout=20)
-        if get_response.status_code == 200:
-            sha = get_response.json().get("sha", "")
+        changed = False
+        prefix = f"{root}/"
+        for remote_path in sorted(remote_paths.keys()):
+            if not remote_path.startswith(prefix):
+                continue
+            rel = remote_path[len(prefix) :]
+            if not rel:
+                continue
 
-        body = {
-            "message": "MaxNet sync bundle",
-            "content": base64.b64encode(local_zip).decode("ascii"),
-            "branch": branch,
-        }
-        if sha:
-            body["sha"] = sha
+            local_path = self.storage.paths.sites_dir / rel
+            if local_path.exists():
+                continue
 
-        put_response = requests.put(url, headers=self._headers(token), json=body, timeout=40)
-        if put_response.status_code in (200, 201):
-            new_sha = put_response.json().get("content", {}).get("sha", "")
-            if new_sha:
-                cfg["last_remote_sha"] = new_sha
-                self.storage.save_config(cfg)
+            resp = requests.get(
+                self._contents_url(repo, remote_path),
+                headers=self._headers(token),
+                params={"ref": branch},
+                timeout=30,
+            )
+            if resp.status_code != 200:
+                continue
+
+            payload = resp.json()
+            encoded = payload.get("content", "")
+            encoding = payload.get("encoding", "")
+            if encoding != "base64" or not encoded:
+                continue
+
+            file_bytes = base64.b64decode(encoded)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(file_bytes)
+            changed = True
+
+        if changed:
+            self.storage.rebuild_index_from_sites()
+
+    def push_missing_files_only(self) -> None:
+        repo, token, branch, root = self._cfg()
+        if not repo or not token:
+            return
+
+        remote_paths = self._remote_tree_paths(repo, token, branch)
+        prefix = f"{root}/"
+
+        for path in self.storage.paths.sites_dir.rglob("*"):
+            if not path.is_file():
+                continue
+
+            rel = path.relative_to(self.storage.paths.sites_dir).as_posix()
+            remote_path = f"{prefix}{rel}"
+
+            if remote_path in remote_paths:
+                continue
+
+            raw = path.read_bytes()
+            body = {
+                "message": f"Add {remote_path} from MaxNet",
+                "content": base64.b64encode(raw).decode("ascii"),
+                "branch": branch,
+            }
+            requests.put(self._contents_url(repo, remote_path), headers=self._headers(token), json=body, timeout=40)
 
 
 class MaxNetServer:
@@ -291,6 +330,31 @@ class MaxNetServer:
         def create_form():
             return render_template_string(CREATE_TEMPLATE)
 
+        @self.app.get("/settings/git")
+        def git_settings_form():
+            cfg = self.storage.get_config()
+            return render_template_string(GIT_SETTINGS_TEMPLATE, cfg=cfg)
+
+        @self.app.post("/settings/git")
+        def git_settings_save():
+            cfg = self.storage.get_config()
+            cfg["github_repo"] = request.form.get("github_repo", "").strip()
+            cfg["github_token"] = request.form.get("github_token", "").strip()
+            cfg["github_branch"] = request.form.get("github_branch", "main").strip() or "main"
+            cfg["github_root"] = request.form.get("github_root", "maxnet/sites").strip().strip("/") or "maxnet/sites"
+            self.storage.save_config(cfg)
+            return redirect(url_for("git_settings_form"))
+
+        @self.app.post("/sync/pull")
+        def sync_pull():
+            self.sync.pull_missing_files()
+            return redirect(url_for("home"))
+
+        @self.app.post("/sync/push")
+        def sync_push():
+            self.sync.push_missing_files_only()
+            return redirect(url_for("home"))
+
         @self.app.post("/publish/simple")
         def publish_simple():
             domain = secure_filename(request.form.get("domain", "").strip().lower())
@@ -299,7 +363,7 @@ class MaxNetServer:
             if not domain or not html_text:
                 return "Нужно заполнить домен и HTML", 400
             self.storage.save_simple_page(domain, title or domain, html_text)
-            self.sync.push_bundle()
+            self.sync.push_missing_files_only()
             return redirect(url_for("home"))
 
         @self.app.post("/publish/zip")
@@ -308,12 +372,18 @@ class MaxNetServer:
             file = request.files.get("archive")
             if not domain or file is None:
                 return "Нужны домен и zip", 400
-            raw = file.read()
+
+            tmp_zip = self.storage.paths.root / f"upload_{int(time.time())}.zip"
+            file.save(tmp_zip)
             try:
-                self.storage.save_site_archive(domain, raw)
+                self.storage.save_site_archive(domain, tmp_zip)
             except ValueError as err:
                 return str(err), 400
-            self.sync.push_bundle()
+            finally:
+                if tmp_zip.exists():
+                    tmp_zip.unlink()
+
+            self.sync.push_missing_files_only()
             return redirect(url_for("home"))
 
         @self.app.get("/api/sites")
@@ -331,7 +401,7 @@ class MaxNetServer:
             if "создать" in q or "сайт" in q:
                 answer = "Откройте Создать сайт, введите домен и загрузите ZIP или вставьте HTML."
             elif "github" in q or "git" in q:
-                answer = "Откройте раздел 'Как настроить GitHub' на странице создания сайта."
+                answer = "Откройте Настройки GitHub и заполните repo/token/branch/root."
             else:
                 answer = "Я бот MaxNet: помогаю с поиском, публикацией и синхронизацией сайтов."
             return jsonify({"q": q, "answer": answer})
@@ -351,7 +421,7 @@ class SyncWorker(threading.Thread):
 
     def run(self) -> None:
         while self.active:
-            self.sync.pull_if_changed()
+            self.sync.pull_missing_files()
             time.sleep(SYNC_INTERVAL_SECONDS)
 
 
@@ -422,8 +492,9 @@ HOME_TEMPLATE = """
     a { text-decoration: none; color: #1344d4; }
     .site { padding: 8px 0; border-bottom: 1px solid #eee; }
     .site:last-child { border-bottom: none; }
-    .row { display:flex; gap: 8px; align-items:center; }
-    .btn { display:inline-block; padding: 8px 12px; border-radius: 10px; background:#1344d4; color:#fff; }
+    .row { display:flex; gap: 8px; align-items:center; margin-top: 8px; }
+    .btn { display:inline-block; padding: 8px 12px; border-radius: 10px; background:#1344d4; color:#fff; border:0; }
+    form.inline { display:inline; }
   </style>
 </head>
 <body>
@@ -433,8 +504,11 @@ HOME_TEMPLATE = """
     <form method="get" action="/">
       <input type="text" name="q" placeholder="Поиск по сайтам и доменам" value="{{ q }}" />
     </form>
-    <div class="row" style="margin-top:12px">
+    <div class="row">
       <a class="btn" href="/create">Создать сайт</a>
+      <a class="btn" href="/settings/git">Настройки GitHub</a>
+      <form class="inline" method="post" action="/sync/pull"><button class="btn" type="submit">Забрать новые из GitHub</button></form>
+      <form class="inline" method="post" action="/sync/push"><button class="btn" type="submit">Добавить новые в GitHub</button></form>
     </div>
   </div>
 
@@ -470,7 +544,6 @@ CREATE_TEMPLATE = """
     textarea { min-height: 220px; }
     button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
     a { color:#1344d4; text-decoration:none; }
-    details { margin-top: 8px; }
     code { background: #eff3ff; padding: 2px 4px; border-radius: 4px; }
   </style>
 </head>
@@ -503,19 +576,54 @@ CREATE_TEMPLATE = """
   </div>
 
   <div class="box">
-    <h3>Как настроить GitHub для синхронизации</h3>
-    <ol>
-      <li>Создайте personal access token на GitHub (минимум: <code>repo</code>).</li>
-      <li>Откройте файл <code>~/Documents/MaxNet/config.json</code>.</li>
-      <li>Заполните:</li>
-    </ol>
-    <pre>{
-  "github_repo": "ВАШ_ЛОГИН/ВАШ_РЕПО",
-  "github_token": "ghp_xxx",
-  "github_branch": "main",
-  "bundle_path": "maxnet/sites_bundle.zip"
-}</pre>
-    <p>После публикации сайта MaxNet сам отправит bundle в GitHub.</p>
+    <h3>Важно про синхронизацию</h3>
+    <p>MaxNet работает в режиме "только добавление":</p>
+    <ul>
+      <li>из GitHub добавляются только отсутствующие локально файлы;</li>
+      <li>в GitHub отправляются только отсутствующие в репозитории файлы;</li>
+      <li>удаление файлов из репозитория MaxNet не делает.</li>
+    </ul>
+    <p>Настройки откройте в <a href="/settings/git">GitHub Settings</a>.</p>
+  </div>
+</body>
+</html>
+"""
+
+
+GIT_SETTINGS_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitHub настройки — MaxNet</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); max-width: 860px; }
+    input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top:6px; margin-bottom: 12px; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
+    a { color:#1344d4; text-decoration:none; }
+  </style>
+</head>
+<body>
+  <h1>GitHub настройки</h1>
+  <a href="/">← Назад на главную</a>
+  <div class="box">
+    <form method="post" action="/settings/git">
+      <label>github_repo (формат: owner/repo)</label>
+      <input type="text" name="github_repo" value="{{ cfg.github_repo or '' }}" placeholder="your_login/your_repo" required>
+
+      <label>github_token (PAT c правами repo)</label>
+      <input type="password" name="github_token" value="{{ cfg.github_token or '' }}" placeholder="ghp_xxx" required>
+
+      <label>github_branch</label>
+      <input type="text" name="github_branch" value="{{ cfg.github_branch or 'main' }}" placeholder="main" required>
+
+      <label>github_root (папка в репозитории)</label>
+      <input type="text" name="github_root" value="{{ cfg.github_root or 'maxnet/sites' }}" placeholder="maxnet/sites" required>
+
+      <button type="submit">Сохранить</button>
+    </form>
   </div>
 </body>
 </html>
@@ -524,6 +632,7 @@ CREATE_TEMPLATE = """
 
 def run_app(with_gui: bool) -> None:
     storage = Storage()
+    storage.rebuild_index_from_sites()
     setup_autostart(storage)
 
     sync = GitHubSync(storage)
