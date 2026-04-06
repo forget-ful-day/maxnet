@@ -37,3 +37,21 @@ python main.py --daemon
 ```
 
 После публикации сайта (`/publish/simple` или `/publish/zip`) MaxNet автоматически отправляет bundle в GitHub и периодически подтягивает изменения с другого устройства.
+
+
+## Если у вас ошибка `No module named PyQt6.QtWebEngineWidgets`
+
+Вы запускаете старую версию файла (например, `15.py`) с зависимостью от PyQt6 WebEngine.
+Текущая версия MaxNet работает через `pywebview` и запускается так:
+
+```bash
+python main.py
+```
+
+Убедитесь, что установлены зависимости именно для новой версии:
+
+```bash
+pip install Flask requests pywebview Werkzeug
+```
+
+`PyQt6-WebEngine` для этой версии **не нужен**.
