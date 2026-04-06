@@ -13,19 +13,19 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import re
 import shutil
 import threading
 import time
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 import requests
 import webview
-from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, send_from_directory, session, url_for
 from werkzeug.utils import secure_filename
 
 APP_NAME = "maxnet"
@@ -38,6 +38,7 @@ GITHUB_REPO = ""  # пример: "your_login/your_repo"
 GITHUB_TOKEN = ""  # пример: "ghp_xxx"
 GITHUB_BRANCH = "main"
 GITHUB_ROOT = "maxnet/sites"
+ADMIN_PASSWORD = "admin123"
 
 
 @dataclass
@@ -46,6 +47,7 @@ class AppPaths:
     sites_dir: Path
     config_file: Path
     index_file: Path
+    chat_file: Path
 
 
 class Storage:
@@ -57,6 +59,7 @@ class Storage:
             sites_dir=root / "sites",
             config_file=root / "config.json",
             index_file=root / "sites_index.json",
+            chat_file=root / "chat.json",
         )
         self._prepare_dirs()
         self._ensure_defaults()
@@ -73,6 +76,8 @@ class Storage:
             self.save_json(self.paths.config_file, default)
         if not self.paths.index_file.exists():
             self.save_json(self.paths.index_file, {"sites": []})
+        if not self.paths.chat_file.exists():
+            self.save_json(self.paths.chat_file, {"messages": []})
 
     def load_json(self, file_path: Path, fallback: dict) -> dict:
         if not file_path.exists():
@@ -175,6 +180,42 @@ class Storage:
 
         title = self._extract_title_from_index(index_file, domain)
         self.add_or_update_site(domain, title)
+
+    def get_site_index_html(self, domain: str) -> str:
+        index_file = self._domain_dir(domain) / "index.html"
+        if not index_file.exists():
+            return ""
+        return index_file.read_text(encoding="utf-8", errors="ignore")
+
+    def save_site_index_html(self, domain: str, title: str, html: str) -> None:
+        site_dir = self._domain_dir(domain)
+        site_dir.mkdir(parents=True, exist_ok=True)
+        index_file = site_dir / "index.html"
+        index_file.write_text(html, encoding="utf-8")
+        self.add_or_update_site(domain, title or domain)
+
+    def delete_site(self, domain: str) -> None:
+        site_dir = self._domain_dir(domain)
+        if site_dir.exists():
+            shutil.rmtree(site_dir)
+        self.rebuild_index_from_sites()
+
+    def get_chat_messages(self) -> List[dict]:
+        payload = self.load_json(self.paths.chat_file, {"messages": []})
+        return payload.get("messages", [])
+
+    def append_chat_message(self, nickname: str, text: str) -> None:
+        payload = self.load_json(self.paths.chat_file, {"messages": []})
+        messages = payload.get("messages", [])
+        messages.append(
+            {
+                "nickname": nickname,
+                "text": text,
+                "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+        )
+        payload["messages"] = messages[-200:]
+        self.save_json(self.paths.chat_file, payload)
 
 
 class GitHubSync:
@@ -295,6 +336,7 @@ class MaxNetServer:
         self.storage = storage
         self.sync = sync
         self.app = Flask(APP_NAME)
+        self.app.secret_key = "maxnet-local-secret"
         self._setup_routes()
 
     def _search(self, query: str) -> List[dict]:
@@ -312,6 +354,9 @@ class MaxNetServer:
         return results
 
     def _setup_routes(self) -> None:
+        def admin_required() -> bool:
+            return bool(session.get("is_admin"))
+
         @self.app.get("/")
         def home():
             q = request.args.get("q", "")
@@ -339,6 +384,12 @@ class MaxNetServer:
 
         @self.app.post("/sync/push")
         def sync_push():
+            self.sync.push_missing_files_only()
+            return redirect(url_for("home"))
+
+        @self.app.post("/sync/update")
+        def sync_update():
+            self.sync.pull_missing_files()
             self.sync.push_missing_files_only()
             return redirect(url_for("home"))
 
@@ -393,6 +444,69 @@ class MaxNetServer:
                 answer = "Я бот MaxNet: помогаю с поиском, публикацией и синхронизацией сайтов."
             return jsonify({"q": q, "answer": answer})
 
+        @self.app.get("/chat")
+        def chat():
+            messages = self.storage.get_chat_messages()
+            return render_template_string(CHAT_TEMPLATE, messages=messages)
+
+        @self.app.post("/chat/post")
+        def chat_post():
+            nickname = request.form.get("nickname", "").strip() or "Гость"
+            text = request.form.get("text", "").strip()
+            if text:
+                self.storage.append_chat_message(nickname, text)
+            return redirect(url_for("chat"))
+
+        @self.app.get("/admin/login")
+        def admin_login_page():
+            return render_template_string(ADMIN_LOGIN_TEMPLATE, error="")
+
+        @self.app.post("/admin/login")
+        def admin_login_submit():
+            password = request.form.get("password", "")
+            if password == ADMIN_PASSWORD:
+                session["is_admin"] = True
+                return redirect(url_for("admin_panel"))
+            return render_template_string(ADMIN_LOGIN_TEMPLATE, error="Неверный пароль")
+
+        @self.app.get("/admin/logout")
+        def admin_logout():
+            session.clear()
+            return redirect(url_for("home"))
+
+        @self.app.get("/admin")
+        def admin_panel():
+            if not admin_required():
+                return redirect(url_for("admin_login_page"))
+            sites = self.storage.list_sites()
+            return render_template_string(ADMIN_PANEL_TEMPLATE, sites=sites)
+
+        @self.app.get("/admin/edit/<domain>")
+        def admin_edit_site(domain: str):
+            if not admin_required():
+                return redirect(url_for("admin_login_page"))
+            html = self.storage.get_site_index_html(domain)
+            site = next((s for s in self.storage.list_sites() if s.get("domain") == domain), None)
+            title = site.get("title", domain) if site else domain
+            return render_template_string(ADMIN_EDIT_TEMPLATE, domain=domain, title=title, html=html)
+
+        @self.app.post("/admin/edit/<domain>")
+        def admin_edit_site_save(domain: str):
+            if not admin_required():
+                return redirect(url_for("admin_login_page"))
+            title = request.form.get("title", "").strip() or domain
+            html = request.form.get("html", "")
+            self.storage.save_site_index_html(domain, title, html)
+            self.sync.push_missing_files_only()
+            return redirect(url_for("admin_panel"))
+
+        @self.app.post("/admin/delete/<domain>")
+        def admin_delete_site(domain: str):
+            if not admin_required():
+                return redirect(url_for("admin_login_page"))
+            self.storage.delete_site(domain)
+            return redirect(url_for("admin_panel"))
+
     def run(self) -> None:
         self.app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
 
@@ -419,39 +533,6 @@ class ServerWorker(threading.Thread):
 
     def run(self) -> None:
         self.server.run()
-
-
-def setup_autostart(storage: Storage) -> None:
-    cfg = storage.get_config()
-    if not cfg.get("first_run", True):
-        return
-
-    script_path = Path(__file__).resolve()
-
-    if os.name == "nt":
-        startup = Path.home() / "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup"
-        startup.mkdir(parents=True, exist_ok=True)
-        bat_file = startup / "maxnet_autostart.bat"
-        bat_file.write_text(f'@echo off\nstart "" "{os.sys.executable}" "{script_path}" --daemon\n', encoding="utf-8")
-    else:
-        autostart = Path.home() / ".config/autostart"
-        autostart.mkdir(parents=True, exist_ok=True)
-        desktop_file = autostart / "maxnet.desktop"
-        desktop_file.write_text(
-            "\n".join(
-                [
-                    "[Desktop Entry]",
-                    "Type=Application",
-                    "Name=MaxNet Daemon",
-                    f"Exec={os.sys.executable} {script_path} --daemon",
-                    "X-GNOME-Autostart-enabled=true",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-    cfg["first_run"] = False
-    storage.save_config(cfg)
 
 
 def run_daemon_forever() -> None:
@@ -493,8 +574,9 @@ HOME_TEMPLATE = """
     </form>
     <div class="row">
       <a class="btn" href="/create">Создать сайт</a>
-      <form class="inline" method="post" action="/sync/pull"><button class="btn" type="submit">Забрать новые из GitHub</button></form>
-      <form class="inline" method="post" action="/sync/push"><button class="btn" type="submit">Добавить новые в GitHub</button></form>
+      <a class="btn" href="/chat">Мини-чат</a>
+      <a class="btn" href="/admin">Админ-панель</a>
+      <form class="inline" method="post" action="/sync/update"><button class="btn" type="submit">Обновить</button></form>
     </div>
   </div>
 
@@ -576,13 +658,158 @@ CREATE_TEMPLATE = """
 """
 
 
+CHAT_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мини-чат — MaxNet</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 16px; }
+    input, textarea { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top:6px; }
+    button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
+    .msg { padding: 8px 0; border-bottom: 1px solid #eee; }
+  </style>
+</head>
+<body>
+  <h1>Мини-чат</h1>
+  <a href="/">← Назад на главную</a>
+  <div class="box">
+    <form method="post" action="/chat/post">
+      <label>Ник</label>
+      <input type="text" name="nickname" placeholder="Ваш ник">
+      <label>Сообщение</label>
+      <textarea name="text" placeholder="Напишите сообщение..." required></textarea>
+      <button type="submit">Отправить</button>
+    </form>
+  </div>
+  <div class="box">
+    <h3>Сообщения</h3>
+    {% if messages %}
+      {% for msg in messages|reverse %}
+        <div class="msg"><b>{{ msg.nickname }}</b> ({{ msg.created_at }}):<br>{{ msg.text }}</div>
+      {% endfor %}
+    {% else %}
+      <p>Пока сообщений нет.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
+
+ADMIN_LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Вход в админ-панель — MaxNet</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); max-width: 480px; }
+    input { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top:6px; }
+    button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
+    .err { color:#b30000; margin-top:8px; }
+  </style>
+</head>
+<body>
+  <h1>Вход в админ-панель</h1>
+  <a href="/">← Назад на главную</a>
+  <div class="box">
+    <form method="post" action="/admin/login">
+      <label>Пароль</label>
+      <input type="password" name="password" required>
+      <button type="submit">Войти</button>
+      {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
+ADMIN_PANEL_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Админ-панель — MaxNet</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 16px; }
+    .row { display:flex; gap: 8px; align-items:center; }
+    .btn { display:inline-block; padding: 8px 12px; border-radius: 10px; background:#1344d4; color:#fff; text-decoration:none; border:0; }
+    .danger { background:#b30000; }
+  </style>
+</head>
+<body>
+  <h1>Админ-панель</h1>
+  <a href="/">← Назад на главную</a> | <a href="/admin/logout">Выйти</a>
+  <div class="box">
+    <h3>Сайты</h3>
+    {% if sites %}
+      {% for site in sites %}
+        <div class="row" style="margin-bottom:8px">
+          <div style="min-width:220px"><b>{{ site.title }}</b><br><small>{{ site.domain }}</small></div>
+          <a class="btn" href="/admin/edit/{{ site.domain }}">Редактировать</a>
+          <form method="post" action="/admin/delete/{{ site.domain }}" onsubmit="return confirm('Удалить сайт?');">
+            <button class="btn danger" type="submit">Удалить</button>
+          </form>
+        </div>
+      {% endfor %}
+    {% else %}
+      <p>Сайтов пока нет.</p>
+    {% endif %}
+  </div>
+</body>
+</html>
+"""
+
+
+ADMIN_EDIT_TEMPLATE = """
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Редактирование сайта — MaxNet</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; background: #f4f6fb; color: #222; }
+    .box { background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 16px; }
+    input, textarea { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top:6px; }
+    textarea { min-height: 360px; font-family: ui-monospace, monospace; }
+    button { margin-top: 12px; padding: 10px 14px; border: 0; border-radius: 10px; background:#1344d4; color:#fff; }
+  </style>
+</head>
+<body>
+  <h1>Редактирование: {{ domain }}</h1>
+  <a href="/admin">← Назад в админ-панель</a>
+  <div class="box">
+    <form method="post" action="/admin/edit/{{ domain }}">
+      <label>Название</label>
+      <input type="text" name="title" value="{{ title }}" required>
+      <label>Код index.html</label>
+      <textarea name="html" required>{{ html }}</textarea>
+      <button type="submit">Сохранить</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
 def run_app(with_gui: bool) -> None:
     storage = Storage()
     storage.rebuild_index_from_sites()
-    setup_autostart(storage)
 
     sync = GitHubSync(storage)
     server = MaxNetServer(storage, sync)
+    sync.pull_missing_files()
+    sync.push_missing_files_only()
 
     server_worker = ServerWorker(server)
     server_worker.start()
